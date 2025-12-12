@@ -41,14 +41,14 @@ def processar_pdf(arquivo):
     
     if not mapa_amostras:
         st.error("❌ Não encontrei nenhum número de registro (Reg. Nº) no texto do PDF.")
-        return None, None
+        return None, None, None
 
     # 2. EXTRAIR DADOS DA TABELA
     with pdfplumber.open(arquivo) as pdf:
         tabelas = pdf.pages[0].extract_tables()
         if not tabelas:
             st.error("❌ Nenhuma tabela encontrada no PDF.")
-            return None, None
+            return None, None, None
             
         tabela_principal = max(tabelas, key=len) # Pega a maior tabela
         debug_info = tabela_principal
@@ -71,7 +71,7 @@ def processar_pdf(arquivo):
         
         if header_idx == -1:
             st.error("❌ Achei IDs no texto, mas não na tabela.")
-            return None, debug_info
+            return None, None, debug_info
 
         # -- B. MAPA DE PARÂMETROS (COM FLEXIBILIDADE) --
         params_map = {
@@ -123,7 +123,7 @@ def processar_pdf(arquivo):
                     except:
                         pass # Valor inválido ou célula vazia
 
-    return resultados, debug_info
+    return resultados, mapa_amostras, debug_info
 
 def gerar_pdf(resultados, mapa_amostras):
     buffer = io.BytesIO()
@@ -170,10 +170,6 @@ def gerar_pdf(resultados, mapa_amostras):
                 
                 row = [p, unid, f"{v_lab:.2f}", f"{v_ref:.2f}", style_dif]
                 data.append(row)
-            else:
-                # Opcional: Mostrar linha vazia se nutriente faltar? 
-                # Melhor não, para tabela não ficar gigante sem dados.
-                pass
 
         if len(data) > 1: # Só cria tabela se tiver dados
             t = Table(data, colWidths=[80,60,70,70,70])
@@ -200,22 +196,15 @@ debug_mode = st.checkbox("Modo Debug (Ver tabela bruta)")
 
 if uploaded_file:
     if st.button("Gerar Relatório"):
-        res, debug_table = processar_pdf(uploaded_file)
+        # ATENÇÃO: Agora retorna 3 valores!
+        res, mapa, debug_table = processar_pdf(uploaded_file)
         
         if res:
-            # Verifica se extraiu algo de fato
             tem_dados = any(len(d) > 0 for d in res.values())
             
             if tem_dados:
-                pdf_bytes = gerar_pdf(res, res.keys()) # Passa chaves temporariamente como mapa reverso
-                # Correção: precisamos passar o mapa_amostras real pro PDF
-                # Vou reconstruir rapidinho o mapa no processar ou retornar ele
-                # Hack rápido: O res.keys() já tem os IDs, vou re-extrair o mapa dentro do gerar_pdf se precisar
-                # Mas o ideal é retornar o mapa_amostras da funcao processar.
-                
-                # AJUSTE RÁPIDO: Vamos re-passar o mapa correto.
-                # O ideal é alterar o return da funcao processar_pdf para: return resultados, mapa_amostras, debug_info
-                # Mas para não complicar, vou confiar que você vai rodar e ver os dados.
+                # CORREÇÃO PRINCIPAL: Passando 'mapa' (o dicionário), não res.keys()
+                pdf_bytes = gerar_pdf(res, mapa)
                 
                 st.success("✅ Relatório gerado com sucesso!")
                 st.download_button("📥 Baixar PDF Final", pdf_bytes, "relatorio_solo.pdf", "application/pdf")
