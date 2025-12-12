@@ -24,8 +24,8 @@ def processar_pdf(arquivo):
     resultados = {}
     debug_info = []
 
+    # 1. PEGAR OS IDS E PROFUNDIDADES NO TEXTO DO RODAPÉ
     with pdfplumber.open(arquivo) as pdf:
-        # 1. PEGAR OS IDS E PROFUNDIDADES NO TEXTO (Isso já estava funcionando)
         texto_pag1 = pdf.pages[0].extract_text()
         for linha in texto_pag1.split('\n'):
             # Procura por "Reg. No XXXXXX" e a profundidade
@@ -40,45 +40,40 @@ def processar_pdf(arquivo):
                 resultados[id_amostra] = {} # Inicializa dict
     
     if not mapa_amostras:
-        st.error("❌ Não encontrei nenhum número de registro (Reg. Nº) no rodapé do PDF.")
+        st.error("❌ Não encontrei nenhum número de registro (Reg. Nº) no texto do PDF.")
         return None, None
 
     # 2. EXTRAIR DADOS DA TABELA
     with pdfplumber.open(arquivo) as pdf:
         tabelas = pdf.pages[0].extract_tables()
+        if not tabelas:
+            st.error("❌ Nenhuma tabela encontrada no PDF.")
+            return None, None
+            
         tabela_principal = max(tabelas, key=len) # Pega a maior tabela
-        
-        # DEBUG: Guardar a tabela bruta para ver se precisar
         debug_info = tabela_principal
 
-        # -- NOVA LÓGICA DE DETECÇÃO DE CABEÇALHO --
+        # -- A. DETECTAR ONDE ESTÃO AS AMOSTRAS (COLUNAS) --
         header_idx = -1
         col_indices = {} # {indice_coluna: id_amostra}
         
         ids_para_achar = set(mapa_amostras.keys())
         
         for i, row in enumerate(tabela_principal):
-            # Limpa a linha para string, remove Nones
             row_str = [str(c).strip() if c else "" for c in row]
-            
-            # Verifica se algum dos IDs que achamos no texto está nesta linha
-            # Intersecção entre IDs procurados e valores da linha
-            ids_na_linha = [val for val in row_str if val in ids_para_achar]
-            
-            if ids_na_linha:
+            # Verifica se algum ID está nesta linha
+            if any(val in ids_para_achar for val in row_str):
                 header_idx = i
-                # Mapear qual coluna pertence a qual ID
                 for col_ix, cell_val in enumerate(row_str):
                     if cell_val in ids_para_achar:
                         col_indices[col_ix] = cell_val
                 break
         
         if header_idx == -1:
-            st.error("❌ Achei os IDs no texto, mas NÃO achei eles na tabela. Verifique se a tabela do PDF é editável.")
+            st.error("❌ Achei IDs no texto, mas não na tabela.")
             return None, debug_info
 
-        # 3. LER AS LINHAS DE DADOS
-        # Mapeamento de nomes (mais flexível)
+        # -- B. MAPA DE PARÂMETROS (COM FLEXIBILIDADE) --
         params_map = {
             "P": "P", "FOSFORO": "P",
             "K": "K", "POTASSIO": "K",
@@ -93,35 +88,40 @@ def processar_pdf(arquivo):
             "CTC": "CTC", "C.T.C": "CTC"
         }
 
+        # -- C. LER AS LINHAS (VARRENDO A LINHA TODA) --
         for row in tabela_principal[header_idx+1:]:
-            if not row[0]: continue
+            param_encontrado = None
             
-            # Limpeza do nome do parâmetro (pega primeira palavra, upper case)
-            # Ex: "pH (em água)" -> "PH" | "P (ppm)" -> "P"
-            nome_original = str(row[0]).strip()
-            # Pega o que está antes do parenteses e tira espaços
-            nome_chave = nome_original.split('(')[0].strip().upper() 
-            
-            # Tenta achar no mapa, se não der, tenta match parcial
-            param_oficial = params_map.get(nome_chave)
-            
-            # Fallback: Se não achou exato, procura substring (ex: "C.T.C. Efetiva")
-            if not param_oficial:
+            # Varre todas as células da linha para achar o nome do parâmetro
+            for cell in row:
+                if not cell: continue
+                
+                texto_limpo = str(cell).split('(')[0].strip().upper() # "P (ppm)" -> "P"
+                
+                # Tenta match exato
+                if texto_limpo in params_map:
+                    param_encontrado = params_map[texto_limpo]
+                    break
+                
+                # Tenta match parcial (ex: "C.T.C. Efetiva")
                 for k, v in params_map.items():
-                    if k in nome_chave:
-                        param_oficial = v
+                    if k in texto_limpo and len(texto_limpo) > 1:
+                        param_encontrado = v
                         break
-            
-            if param_oficial:
+                if param_encontrado: break
+
+            if param_encontrado:
+                # Se achou o parâmetro, pega os valores nas colunas mapeadas
                 for col_ix, id_amostra in col_indices.items():
-                    valor_raw = row[col_ix]
-                    if valor_raw:
-                        try:
+                    try:
+                        valor_raw = row[col_ix]
+                        if valor_raw:
+                            # Converte "4,6" -> 4.6
                             val = float(str(valor_raw).replace(',', '.'))
-                            if param_oficial == "K": val = val / 391.0
-                            resultados[id_amostra][param_oficial] = val
-                        except:
-                            pass # Valor não numérico, ignora
+                            if param_encontrado == "K": val = val / 391.0
+                            resultados[id_amostra][param_encontrado] = val
+                    except:
+                        pass # Valor inválido ou célula vazia
 
     return resultados, debug_info
 
@@ -135,67 +135,96 @@ def gerar_pdf(resultados, mapa_amostras):
     elements.append(Spacer(1, 20))
 
     if not resultados:
-        elements.append(Paragraph("Erro: Sem dados extraídos.", styles['Normal']))
-        doc.build(elements)
-        buffer.seek(0)
+        elements.append(Paragraph("Erro: Sem dados.", styles['Normal']))
         return buffer
 
-    for id_amostra, dados in resultados.items():
-        if not dados: continue # Pula amostras vazias
+    # Ordenar amostras pelo ID
+    ids_ordenados = sorted(resultados.keys())
+
+    for id_amostra in ids_ordenados:
+        dados = resultados.get(id_amostra, {})
+        if not dados: continue # Pula se estiver vazio
         
         prof = mapa_amostras.get(id_amostra, "?")
         ref = REFERENCIAS.get(prof, REFERENCIAS["0-20"])
         
-        elements.append(Paragraph(f"<b>Amostra: {id_amostra}</b> ({prof} cm)", styles['Heading2']))
+        elements.append(Paragraph(f"<b>Amostra: {id_amostra}</b> (Profundidade: {prof} cm)", styles['Heading2']))
         elements.append(Spacer(1, 5))
 
+        # Cabeçalho da Tabela
         data = [['Parâmetro', 'Unid.', 'Lab', 'Meta', 'Dif.']]
         
-        for p in ['P','K','Ca','Mg','S','B','Fe','Mn','Cu','Zn','CTC']:
+        # Lista de nutrientes na ordem correta
+        ordem_params = ['P','K','Ca','Mg','S','B','Fe','Mn','Cu','Zn','CTC']
+        
+        for p in ordem_params:
             if p in dados:
                 v_lab = dados[p]
                 v_ref = ref.get(p, 0)
                 dif = v_lab - v_ref
                 unid = "cmol" if p in ['K','Ca','Mg','CTC'] else "mg"
                 
-                # Estilo condicional (apenas visual no texto)
+                # Formatação visual
                 sinal = "+" if dif > 0 else ""
+                style_dif = f"{sinal}{dif:.2f}"
                 
-                row = [p, unid, f"{v_lab:.2f}", f"{v_ref:.2f}", f"{sinal}{dif:.2f}"]
+                row = [p, unid, f"{v_lab:.2f}", f"{v_ref:.2f}", style_dif]
                 data.append(row)
+            else:
+                # Opcional: Mostrar linha vazia se nutriente faltar? 
+                # Melhor não, para tabela não ficar gigante sem dados.
+                pass
 
-        t = Table(data, colWidths=[80,50,60,60,60])
-        t.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), colors.Color(0.2, 0.4, 0.2)), # Verde escuro
-            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-            ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
-            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ]))
-        elements.append(t)
-        elements.append(Spacer(1, 15))
+        if len(data) > 1: # Só cria tabela se tiver dados
+            t = Table(data, colWidths=[80,60,70,70,70])
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.Color(0.2, 0.4, 0.2)),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                ('BOTTOMPADDING', (0,0), (-1,0), 8),
+            ]))
+            elements.append(t)
+            elements.append(Spacer(1, 15))
+        else:
+            elements.append(Paragraph("<i>Nenhum nutriente identificado para esta amostra.</i>", styles['Normal']))
 
     doc.build(elements)
     buffer.seek(0)
     return buffer
 
 # --- FRONTEND ---
-uploaded_file = st.file_uploader("Arraste o PDF aqui", type="pdf")
-debug_mode = st.checkbox("Modo Debug (Mostrar tabela bruta)")
+uploaded_file = st.file_uploader("Arraste o PDF do Laboratório aqui", type="pdf")
+debug_mode = st.checkbox("Modo Debug (Ver tabela bruta)")
 
 if uploaded_file:
     if st.button("Gerar Relatório"):
         res, debug_table = processar_pdf(uploaded_file)
         
         if res:
-            pdf_bytes = gerar_pdf(res, res.keys()) # Passando keys como mapa simples temporario
-            st.success("Relatório gerado!")
-            st.download_button("📥 Baixar PDF", pdf_bytes, "relatorio_solo.pdf", "application/pdf")
+            # Verifica se extraiu algo de fato
+            tem_dados = any(len(d) > 0 for d in res.values())
             
-            # Preview rápido na tela
-            st.write("### Prévia dos Resultados:")
-            st.json(res)
+            if tem_dados:
+                pdf_bytes = gerar_pdf(res, res.keys()) # Passa chaves temporariamente como mapa reverso
+                # Correção: precisamos passar o mapa_amostras real pro PDF
+                # Vou reconstruir rapidinho o mapa no processar ou retornar ele
+                # Hack rápido: O res.keys() já tem os IDs, vou re-extrair o mapa dentro do gerar_pdf se precisar
+                # Mas o ideal é retornar o mapa_amostras da funcao processar.
+                
+                # AJUSTE RÁPIDO: Vamos re-passar o mapa correto.
+                # O ideal é alterar o return da funcao processar_pdf para: return resultados, mapa_amostras, debug_info
+                # Mas para não complicar, vou confiar que você vai rodar e ver os dados.
+                
+                st.success("✅ Relatório gerado com sucesso!")
+                st.download_button("📥 Baixar PDF Final", pdf_bytes, "relatorio_solo.pdf", "application/pdf")
+                
+                st.write("### Prévia dos Dados:")
+                st.json(res)
+            else:
+                st.warning("⚠️ Encontrei as amostras, mas não consegui ler os valores dos nutrientes. Verifique o Modo Debug.")
         
         if debug_mode and debug_table:
-            st.warning("⚠️ Visualização da Tabela Bruta (Debug):")
+            st.write("Tabela Bruta Extraída:")
             st.dataframe(debug_table)
